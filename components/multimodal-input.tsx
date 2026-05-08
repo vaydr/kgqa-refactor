@@ -1,0 +1,491 @@
+"use client";
+
+import type { UseChatHelpers } from "@ai-sdk/react";
+import equal from "fast-deep-equal";
+import {
+  type ChangeEvent,
+  type Dispatch,
+  memo,
+  type SetStateAction,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { toast } from "sonner";
+import { useLocalStorage, useWindowSize } from "usehooks-ts";
+import type { Attachment, ChatMessage } from "@/lib/types";
+import { cn } from "@/lib/utils";
+import {
+  PromptInput,
+  PromptInputSubmit,
+  PromptInputTextarea,
+  PromptInputToolbar,
+  PromptInputTools,
+} from "./elements/prompt-input";
+import { ArrowUpIcon, ChevronDownIcon, PaperclipIcon, StopIcon } from "./icons";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "./ui/collapsible";
+import { PreviewAttachment } from "./preview-attachment";
+import { Button } from "./ui/button";
+
+function PureMultimodalInput({
+  chatId,
+  input,
+  setInput,
+  status,
+  stop,
+  attachments,
+  setAttachments,
+  setMessages,
+  sendMessage,
+  className,
+  selectedModelId,
+  onBeforeSend,
+  sampleQueries = [],
+  isSuggesting = false,
+}: {
+  chatId: string;
+  input: string;
+  setInput: Dispatch<SetStateAction<string>>;
+  status: UseChatHelpers<ChatMessage>["status"];
+  stop: () => void;
+  attachments: Attachment[];
+  setAttachments: Dispatch<SetStateAction<Attachment[]>>;
+  setMessages: UseChatHelpers<ChatMessage>["setMessages"];
+  sendMessage: UseChatHelpers<ChatMessage>["sendMessage"];
+  className?: string;
+  selectedModelId: string;
+  onBeforeSend?: () => void;
+  sampleQueries?: { question: string }[];
+  isSuggesting?: boolean;
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const { width } = useWindowSize();
+
+  const adjustHeight = useCallback(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "44px";
+    }
+  }, []);
+
+  useEffect(() => {
+    if (textareaRef.current) {
+      adjustHeight();
+    }
+  }, [adjustHeight]);
+
+  const hasAutoFocused = useRef(false);
+  useEffect(() => {
+    if (!hasAutoFocused.current && width) {
+      const timer = setTimeout(() => {
+        textareaRef.current?.focus();
+        hasAutoFocused.current = true;
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [width]);
+
+  const resetHeight = useCallback(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = "44px";
+    }
+  }, []);
+
+  const [localStorageInput, setLocalStorageInput] = useLocalStorage(
+    "input",
+    ""
+  );
+
+  const [inputHydrated, setInputHydrated] = useState(false);
+
+  useEffect(() => {
+    if (textareaRef.current) {
+      const domValue = textareaRef.current.value;
+      const finalValue = domValue || localStorageInput || "";
+      setInput(finalValue);
+      adjustHeight();
+      setInputHydrated(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adjustHeight, localStorageInput, setInput]);
+
+  useEffect(() => {
+    setLocalStorageInput(input);
+  }, [input, setLocalStorageInput]);
+
+  const handleInput = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(event.target.value);
+  };
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploadQueue, setUploadQueue] = useState<string[]>([]);
+
+  const submitForm = useCallback(() => {
+    onBeforeSend?.();
+
+    window.history.pushState({}, "", `/chat/${chatId}`);
+
+    sendMessage({
+      role: "user",
+      parts: [
+        ...attachments.map((attachment) => ({
+          type: "file" as const,
+          url: attachment.url,
+          name: attachment.name,
+          mediaType: attachment.contentType,
+        })),
+        {
+          type: "text",
+          text: input,
+        },
+      ],
+    });
+
+    setAttachments([]);
+    setLocalStorageInput("");
+    resetHeight();
+    setInput("");
+
+    if (width && width > 768) {
+      textareaRef.current?.focus();
+    }
+  }, [
+    input,
+    setInput,
+    attachments,
+    sendMessage,
+    setAttachments,
+    setLocalStorageInput,
+    width,
+    chatId,
+    resetHeight,
+    onBeforeSend,
+  ]);
+
+  const uploadFile = useCallback(async (file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+      const response = await fetch("/api/files/upload", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const { url, pathname, contentType } = data;
+
+        return {
+          url,
+          name: pathname,
+          contentType,
+        };
+      }
+      const { error } = await response.json();
+      toast.error(error);
+    } catch (_error) {
+      toast.error("Failed to upload file, please try again!");
+    }
+  }, []);
+
+  const handleFileChange = useCallback(
+    async (event: ChangeEvent<HTMLInputElement>) => {
+      const files = Array.from(event.target.files || []);
+
+      setUploadQueue(files.map((file) => file.name));
+
+      try {
+        const uploadPromises = files.map((file) => uploadFile(file));
+        const uploadedAttachments = await Promise.all(uploadPromises);
+        const successfullyUploadedAttachments = uploadedAttachments.filter(
+          (attachment) => attachment !== undefined
+        );
+
+        setAttachments((currentAttachments) => [
+          ...currentAttachments,
+          ...successfullyUploadedAttachments,
+        ]);
+      } catch (error) {
+        console.error("Error uploading files!", error);
+      } finally {
+        setUploadQueue([]);
+      }
+    },
+    [setAttachments, uploadFile]
+  );
+
+  const handlePaste = useCallback(
+    async (event: ClipboardEvent) => {
+      const items = event.clipboardData?.items;
+      if (!items) {
+        return;
+      }
+
+      const imageItems = Array.from(items).filter((item) =>
+        item.type.startsWith("image/")
+      );
+
+      if (imageItems.length === 0) {
+        return;
+      }
+
+      event.preventDefault();
+
+      setUploadQueue((prev) => [...prev, "Pasted image"]);
+
+      try {
+        const uploadPromises = imageItems
+          .map((item) => item.getAsFile())
+          .filter((file): file is File => file !== null)
+          .map((file) => uploadFile(file));
+
+        const uploadedAttachments = await Promise.all(uploadPromises);
+        const successfullyUploadedAttachments = uploadedAttachments.filter(
+          (attachment) =>
+            attachment !== undefined &&
+            attachment.url !== undefined &&
+            attachment.contentType !== undefined
+        );
+
+        setAttachments((curr) => [
+          ...curr,
+          ...(successfullyUploadedAttachments as Attachment[]),
+        ]);
+      } catch (error) {
+        console.error("Error uploading pasted images:", error);
+        toast.error("Failed to upload pasted image(s)");
+      } finally {
+        setUploadQueue([]);
+      }
+    },
+    [setAttachments, uploadFile]
+  );
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) {
+      return;
+    }
+
+    textarea.addEventListener("paste", handlePaste);
+    return () => textarea.removeEventListener("paste", handlePaste);
+  }, [handlePaste]);
+
+  return (
+    <div className={cn("relative flex w-full flex-col gap-4", className)}>
+      <input
+        className="-top-4 -left-4 pointer-events-none fixed size-0.5 opacity-0"
+        multiple
+        onChange={handleFileChange}
+        ref={fileInputRef}
+        tabIndex={-1}
+        type="file"
+      />
+
+      <PromptInput
+        className="rounded-lg border border-border/30 bg-muted/20 p-2.5 transition-all duration-200 focus-within:border-border/60 focus-within:bg-muted/30"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (status === "submitted" || status === "streaming") {
+            toast.error("Please wait for the model to finish its response!");
+          } else {
+            submitForm();
+          }
+        }}
+      >
+        {(attachments.length > 0 || uploadQueue.length > 0) && (
+          <div
+            className="flex flex-row items-end gap-2 overflow-x-scroll"
+            data-testid="attachments-preview"
+          >
+            {attachments.map((attachment) => (
+              <PreviewAttachment
+                attachment={attachment}
+                key={attachment.url}
+                onRemove={() => {
+                  setAttachments((currentAttachments) =>
+                    currentAttachments.filter((a) => a.url !== attachment.url)
+                  );
+                  if (fileInputRef.current) {
+                    fileInputRef.current.value = "";
+                  }
+                }}
+              />
+            ))}
+
+            {uploadQueue.map((filename) => (
+              <PreviewAttachment
+                attachment={{
+                  url: "",
+                  name: filename,
+                  contentType: "",
+                }}
+                isUploading={true}
+                key={filename}
+              />
+            ))}
+          </div>
+        )}
+        {isSuggesting && (
+          <div className="flex items-center gap-1.5 px-1.5 pt-0.5">
+            <span className="inline-block size-1 animate-pulse rounded-full bg-muted-foreground/40" />
+            <span className="font-mono text-[9px] text-muted-foreground/40">
+              Generating...
+            </span>
+          </div>
+        )}
+        <div className="flex flex-row items-start gap-1 sm:gap-2">
+          <PromptInputTextarea
+            className="grow resize-none border-0! border-none! bg-transparent p-1.5 text-sm outline-none ring-0 [-ms-overflow-style:none] [scrollbar-width:none] placeholder:text-muted-foreground/50 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 [&::-webkit-scrollbar]:hidden"
+            data-testid="multimodal-input"
+            disableAutoResize={true}
+            maxHeight={200}
+            minHeight={44}
+            onChange={handleInput}
+            placeholder={
+              isSuggesting ? "Generating question..." : "Send a message..."
+            }
+            ref={textareaRef}
+            rows={1}
+            value={input}
+          />
+        </div>
+        <PromptInputToolbar className="border-top-0! border-t-0! p-0 shadow-none dark:border-0 dark:border-transparent!">
+          <PromptInputTools className="gap-0 sm:gap-0.5">
+            <AttachmentsButton
+              fileInputRef={fileInputRef}
+              selectedModelId={selectedModelId}
+              status={status}
+            />
+          </PromptInputTools>
+
+          {status === "submitted" || status === "streaming" ? (
+            <StopButton setMessages={setMessages} stop={stop} />
+          ) : (
+            <PromptInputSubmit
+              className="size-7 rounded-md bg-foreground text-background transition-colors duration-200 hover:bg-foreground/80 disabled:bg-muted disabled:text-muted-foreground"
+              data-testid="send-button"
+              disabled={!input.trim() || uploadQueue.length > 0}
+              status={status}
+            >
+              <ArrowUpIcon size={14} />
+            </PromptInputSubmit>
+          )}
+        </PromptInputToolbar>
+      </PromptInput>
+
+      {inputHydrated && sampleQueries.length > 0 && (
+        <Collapsible defaultOpen data-testid="sample-query-chips">
+          <CollapsibleTrigger className="flex cursor-pointer items-center gap-1 pt-1 font-mono font-semibold text-[11px] text-foreground/80 uppercase tracking-wide transition-colors hover:text-foreground">
+            <span className="transition-transform [[data-state=closed]_&]:-rotate-90">
+              <ChevronDownIcon size={12} />
+            </span>
+            Study Questions
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="flex flex-col gap-0.5 pt-1">
+              {sampleQueries.map(({ question }, index) => (
+                <button
+                  className="cursor-pointer truncate rounded px-1.5 py-0.5 text-left font-mono text-[11px] text-foreground/75 transition-colors hover:bg-muted/40 hover:text-foreground"
+                  data-testid="sample-query-chip"
+                  key={question}
+                  onClick={() => {
+                    setInput(question);
+                    requestAnimationFrame(() => textareaRef.current?.focus());
+                  }}
+                  type="button"
+                >
+                  {`${index + 1}. ${question}`}
+                </button>
+              ))}
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      )}
+    </div>
+  );
+}
+
+export const MultimodalInput = memo(
+  PureMultimodalInput,
+  (prevProps, nextProps) => {
+    if (prevProps.input !== nextProps.input) {
+      return false;
+    }
+    if (prevProps.status !== nextProps.status) {
+      return false;
+    }
+    if (!equal(prevProps.attachments, nextProps.attachments)) {
+      return false;
+    }
+    if (prevProps.selectedModelId !== nextProps.selectedModelId) {
+      return false;
+    }
+    if (!equal(prevProps.sampleQueries, nextProps.sampleQueries)) {
+      return false;
+    }
+    if (prevProps.isSuggesting !== nextProps.isSuggesting) {
+      return false;
+    }
+    return true;
+  }
+);
+
+function PureAttachmentsButton({
+  fileInputRef,
+  status,
+  selectedModelId,
+}: {
+  fileInputRef: React.MutableRefObject<HTMLInputElement | null>;
+  status: UseChatHelpers<ChatMessage>["status"];
+  selectedModelId: string;
+}) {
+  const isReasoningModel =
+    selectedModelId.includes("reasoning") || selectedModelId.includes("think");
+
+  return (
+    <Button
+      className="aspect-square h-8 rounded-lg p-1 transition-colors hover:bg-accent"
+      data-testid="attachments-button"
+      disabled={status !== "ready" || isReasoningModel}
+      onClick={(event) => {
+        event.preventDefault();
+        fileInputRef.current?.click();
+      }}
+      variant="ghost"
+    >
+      <PaperclipIcon size={14} style={{ width: 14, height: 14 }} />
+    </Button>
+  );
+}
+
+const AttachmentsButton = memo(PureAttachmentsButton);
+
+function PureStopButton({
+  stop,
+  setMessages,
+}: {
+  stop: () => void;
+  setMessages: UseChatHelpers<ChatMessage>["setMessages"];
+}) {
+  return (
+    <Button
+      className="size-7 rounded-full bg-foreground p-1 text-background transition-colors duration-200 hover:bg-foreground/90 disabled:bg-muted disabled:text-muted-foreground"
+      data-testid="stop-button"
+      onClick={(event) => {
+        event.preventDefault();
+        stop();
+        setMessages((messages) => messages);
+      }}
+    >
+      <StopIcon size={14} />
+    </Button>
+  );
+}
+
+const StopButton = memo(PureStopButton);

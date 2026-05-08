@@ -1,0 +1,2 @@
+export const DEFAULT_DATA_PANEL_SIZE = 0;
+export const DEFAULT_CHAT_PANEL_SIZE = 100;
